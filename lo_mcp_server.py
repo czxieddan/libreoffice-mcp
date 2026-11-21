@@ -50,16 +50,25 @@ import traceback
 VERSION = "1.0.0"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
+
+def _norm_win(p):
+    """Collapse literal doubled backslashes some clients pass through."""
+    if os.name == "nt" and p and p.count("\\\\") > 0:
+        p = p.replace("\\\\", "\\")
+    return p
+
+
 PORT = int(os.environ.get("LO_MCP_PORT", "2002"))
 PROFILE = os.path.expanduser(
-    os.environ.get("LO_MCP_PROFILE", "~/.cache/lo-mcp-profile"))
-SOFFICE = os.environ.get("LO_MCP_SOFFICE", "")
+    _norm_win(os.environ.get("LO_MCP_PROFILE", "~/.cache/lo-mcp-profile")))
+SOFFICE = _norm_win(os.environ.get("LO_MCP_SOFFICE", ""))
 ALLOW_EXEC = os.environ.get("LO_MCP_ALLOW_EXEC", "") == "1"
 OWN_ONLY = os.environ.get("LO_MCP_OWN_SOFFICE_ONLY", "") == "1"
 SANDBOX = os.environ.get("LO_MCP_SANDBOX", "")
-ROOTS = [os.path.realpath(os.path.expanduser(p))
-         for p in os.environ.get("LO_MCP_ROOTS",
-                                 os.path.expanduser("~") + ":/tmp").split(":") if p]
+# Empty by default: any path is reachable. Set LO_MCP_ROOTS
+# (path-separator delimited) to confine the server to specific dirs.
+ROOTS = [os.path.realpath(os.path.expanduser(_norm_win(p)))
+         for p in os.environ.get("LO_MCP_ROOTS", "").split(os.pathsep) if p]
 
 
 def log(*a):
@@ -85,6 +94,7 @@ class LO:
         self.proc = None
         self.spawned = False
         self.docs = {}       # doc_id -> component
+        self.meta = {}       # doc_id -> {kind, agent_created, visible}
         self._next = 1
 
     # -- connection ---------------------------------------------------
@@ -108,46 +118,44 @@ class LO:
 
     def _spawn(self):
         os.makedirs(PROFILE, exist_ok=True)
+        # No --headless here: --invisible keeps the process windowless
+        # while still allowing document windows to be shown on request.
         cmd = [
             self._soffice_bin(),
             "-env:UserInstallation=%s" % unohelper.systemPathToFileUrl(PROFILE),
-            "--headless", "--invisible", "--nodefault", "--nologo",
+            "--invisible", "--nodefault", "--nologo",
             "--nolockcheck", "--norestore", "--nofirststartwizard",
             "--accept=socket,host=127.0.0.1,port=%d;urp;StarOffice.ServiceManager"
             % PORT,
         ]
-        log("starting:", " ".join(cmd))
+        log("starting (shared mode):", " ".join(cmd))
         devnull = open(os.devnull, "wb")
         self.proc = subprocess.Popen(
             cmd, stdout=devnull, stderr=devnull, stdin=subprocess.DEVNULL,
-            start_new_session=True)
+            start_new_session=hasattr(os, "setsid"))
         self.spawned = True
-
     def connect(self, timeout=60):
         if self.desktop is not None:
-            try:                      # cheap liveness probe
-                self.desktop.getCurrentComponent
+            # Call through, do not just touch the attribute: a dead
+            # bridge raises here, whereas attribute access does not.
+            try:
+                self.desktop.getCurrentComponent()
                 return self.desktop
             except Exception:
                 self.ctx = self.desktop = None
+
+        # Prefer the instance the user already has running; only spawn
+        # our own if nothing is listening on the port.
         try:
-            if OWN_ONLY and not self.spawned:
-                # Do not adopt a stranger's LibreOffice: it may sit outside the
-                # confinement this server was started in.
-                raise RuntimeError("own-soffice-only")
             self.ctx = self._resolve()
+            self.spawned = False
         except Exception:
-            if OWN_ONLY and not self.spawned:
-                try:
-                    self._resolve()
-                except Exception:
-                    pass
-                else:
-                    raise RuntimeError(
-                        "something is already listening on port %d; refusing to "
-                        "attach to a LibreOffice this server did not start "
-                        "(LO_MCP_OWN_SOFFICE_ONLY=1). Use a different "
-                        "LO_MCP_PORT." % PORT)
+            if OWN_ONLY:
+                # Own-instance-only mode: never adopt a foreign instance.
+                raise RuntimeError(
+                    "No LibreOffice on port %d. Start one with an UNO "
+                    "socket (see bin/start_shared) or unset "
+                    "LO_MCP_OWN_SOFFICE_ONLY." % PORT)
             self._spawn()
             deadline = time.time() + timeout
             last = None
@@ -159,20 +167,31 @@ class LO:
                 except Exception as e:
                     last = e
             else:
-                raise RuntimeError("could not connect to LibreOffice: %s" % last)
+                raise RuntimeError(
+                    "could not connect to LibreOffice: %s" % last)
         self.desktop = self.ctx.ServiceManager.createInstanceWithContext(
             "com.sun.star.frame.Desktop", self.ctx)
         return self.desktop
 
     def svc(self, name):
         self.connect()
-        return self.ctx.ServiceManager.createInstanceWithContext(name, self.ctx)
-
+        try:
+            return self.ctx.ServiceManager.createInstanceWithContext(name, self.ctx)
+        except Exception:
+            # Stale context: the instance was replaced underneath us.
+            self.ctx = self.desktop = None
+            self.connect()
+            return self.ctx.ServiceManager.createInstanceWithContext(name, self.ctx)
     # -- documents ----------------------------------------------------
-    def register(self, doc, kind):
+    def register(self, doc, kind, visible=True):
         did = "%s%d" % (kind, self._next)
         self._next += 1
         self.docs[did] = doc
+        self.meta[did] = {
+            "kind": kind,
+            "agent_created": True,
+            "visible": visible,
+        }
         return did
 
     def get(self, doc_id):
@@ -181,6 +200,52 @@ class LO:
             raise RuntimeError("unknown doc_id %r (use lo_list_docs)" % doc_id)
         return doc
 
+    def set_visible(self, doc_id, visible):
+        """Show or hide one document window, leaving the others alone."""
+        doc = self.get(doc_id)
+        win = doc.getCurrentController().getFrame().getContainerWindow()
+        win.setVisible(visible)
+        self.meta[doc_id]["visible"] = visible
+        return visible
+
+    def doc_visible(self, doc_id):
+        try:
+            win = self.get(doc_id).getCurrentController().getFrame().getContainerWindow()
+            return bool(win.isVisible())
+        except Exception:
+            return self.meta.get(doc_id, {}).get("visible", False)
+
+    def find_open(self, url):
+        """Return the already-open component for this URL, if any."""
+        assert self.desktop is not None
+        enum = self.desktop.Components.createEnumeration()
+        while enum.hasMoreElements():
+            c = enum.nextElement()
+            try:
+                if c.getURL() and c.getURL() == url:
+                    return c
+            except Exception:
+                continue
+        return None
+
+    def adopt(self, doc, visible=None):
+        """Track an existing component, reusing its doc_id when known."""
+        for did, d in self.docs.items():
+            try:
+                if d.getURL() and doc.getURL() and d.getURL() == doc.getURL():
+                    if visible is not None:
+                        self.set_visible(did, visible)
+                    return did
+            except Exception:
+                continue
+        return self.register(doc, doc_kind(doc), visible=self._is_visible(doc))
+
+    def _is_visible(self, doc):
+        try:
+            return bool(doc.getCurrentController().getFrame()
+                        .getContainerWindow().isVisible())
+        except Exception:
+            return True
 
 LO_ = LO()
 
@@ -195,16 +260,28 @@ def props(**kw):
     return tuple(out)
 
 
+def _root_allows(path, root):
+    """True when path sits inside root, on any platform."""
+    root = root.rstrip("/\\") or root
+    return path == root or path.startswith(root + os.sep)
+
+
 def check_path(path, write=False):
+    """Resolve to an absolute path.
+
+    No restriction unless LO_MCP_ROOTS is set; a single "/" entry
+    disables the check entirely.
+    """
     p = os.path.realpath(os.path.expanduser(path))
-    if ROOTS and "/" not in [r for r in ROOTS]:
-        base = p if write else p
-        if not any(base == r or base.startswith(r.rstrip("/") + "/")
-                   for r in ROOTS):
+    if ROOTS and any(r.rstrip("/\\") in ("/", "\\") for r in ROOTS):
+        return p                      # explicit "/" disables the check
+    if ROOTS:
+        if not any(_root_allows(p, r) for r in ROOTS):
             raise RuntimeError(
-                "path %s is outside allowed roots %s (set LO_MCP_ROOTS)"
-                % (p, ":".join(ROOTS)))
+                "path %s is outside allowed roots %s (unset LO_MCP_ROOTS "
+                "to allow any path)" % (p, os.pathsep.join(ROOTS)))
     return p
+
 
 
 def to_url(path, write=False):
@@ -309,15 +386,22 @@ def t_status(a):
         return {"connected": False, "error": str(e)}
 
 
-@tool("lo_list_docs", "List documents currently open in this session.", obj({}))
+@tool("lo_list_docs", "List documents currently open, with per-document "
+                      "visibility and origin info.", obj({}))
 def t_list_docs(a):
     out = []
     for did, doc in list(LO_.docs.items()):
         try:
             url = doc.getURL()
-            out.append({"doc_id": did, "kind": doc_kind(doc),
-                        "path": unohelper.fileUrlToSystemPath(url) if url else None,
-                        "modified": bool(doc.isModified())})
+            meta = LO_.meta.get(did, {})
+            out.append({
+                "doc_id": did,
+                "kind": doc_kind(doc),
+                "path": unohelper.fileUrlToSystemPath(url) if url else None,
+                "modified": bool(doc.isModified()),
+                "visible": LO_.doc_visible(did),
+                "agent_created": meta.get("agent_created", True),
+            })
         except Exception:
             LO_.docs.pop(did, None)      # died underneath us
     return {"docs": out}
@@ -325,31 +409,50 @@ def t_list_docs(a):
 
 @tool("lo_new", "Create a new empty document and return its doc_id.",
       obj({"kind": {"type": "string", "enum": list(FACTORY),
-                    "description": "writer | calc | impress | draw"}},
+                    "description": "writer | calc | impress | draw"},
+           "visible": B("Show the document window (default true)")},
           ["kind"]))
 def t_new(a):
     kind = a["kind"]
+    visible = bool(a.get("visible", True))
     desktop = LO_.connect()
-    doc = desktop.loadComponentFromURL(FACTORY[kind], "_blank", 0,
-                                       props(Hidden=True))
-    return {"doc_id": LO_.register(doc, kind), "kind": kind}
+    doc = desktop.loadComponentFromURL(
+        FACTORY[kind], "_blank", 0,
+        props(Hidden=not visible))
+    return {"doc_id": LO_.register(doc, kind, visible=visible), "kind": kind,
+            "visible": visible}
 
 
-@tool("lo_open", "Open an existing document file and return its doc_id.",
+@tool("lo_open", "Open an existing document file and return its doc_id. "
+                 "Default shows the window so the user can watch/co-edit.",
       obj({"path": S("Absolute path to the document"),
-           "read_only": B("Open read-only (default false)")}, ["path"]))
+           "read_only": B("Open read-only (default false)"),
+           "visible": B("Show the document window (default true)")},
+          ["path"]))
 def t_open(a):
     desktop = LO_.connect()
+    visible = bool(a.get("visible", True))
     url = to_url(a["path"])
     if not os.path.exists(check_path(a["path"])):
         raise RuntimeError("no such file: %s" % a["path"])
+
+    # Reuse the component the user already has open. Both sides then
+    # edit one object, so edits are visible immediately and no file
+    # lock is taken a second time.
+    existing = LO_.find_open(url)
+    if existing is not None:
+        doc_id = LO_.adopt(existing, visible=visible)
+        return {"doc_id": doc_id, "kind": doc_kind(existing),
+                "visible": LO_.doc_visible(doc_id), "shared": True}
+
     doc = desktop.loadComponentFromURL(
-        url, "_blank", 0, props(Hidden=True,
+        url, "_blank", 0, props(Hidden=not visible,
                                 ReadOnly=bool(a.get("read_only", False))))
     if doc is None:
         raise RuntimeError("LibreOffice could not load %s" % a["path"])
     kind = doc_kind(doc)
-    return {"doc_id": LO_.register(doc, kind), "kind": kind}
+    return {"doc_id": LO_.register(doc, kind, visible=visible), "kind": kind,
+            "visible": visible, "shared": False}
 
 
 @tool("lo_save", "Save a document. Without path, saves in place. The output "
@@ -364,24 +467,48 @@ def t_save(a):
         if not doc.getURL():
             raise RuntimeError("document has no path yet; pass 'path'")
         doc.store()
+        doc.setModified(False)
         return {"saved": unohelper.fileUrlToSystemPath(doc.getURL())}
     target = check_path(path, write=True)
     os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
     doc.storeToURL(unohelper.systemPathToFileUrl(target),
                    props(FilterName=filter_for(doc, target), Overwrite=True))
+    # storeToURL leaves the modified flag set; clear it so lo_close
+    # treats the document as saved.
+    doc.setModified(False)
     return {"saved": target, "filter": filter_for(doc, target)}
 
 
-@tool("lo_close", "Close a document, optionally saving it first.",
+@tool("lo_close", "Close a document, optionally saving it first. "
+                  "Can close any open doc_id (lo_list_docs). "
+                  "Only close windows the user has agreed to close, "
+                  "or documents with no unsaved changes.",
       obj({"doc_id": S(), "save": B("Save before closing (default false)")},
           ["doc_id"]))
 def t_close(a):
     doc = LO_.get(a["doc_id"])
     if a.get("save") and doc.getURL():
         doc.store()
-    doc.close(True)
+    # Refuse to discard unsaved work unless the caller asked to save.
+    if not a.get("save") and doc.isModified():
+        raise RuntimeError(
+            "%s has unsaved changes; pass save=true to store them "
+            "first, or ask the user before discarding" % a["doc_id"])
+    doc.close(False)
     LO_.docs.pop(a["doc_id"], None)
+    LO_.meta.pop(a["doc_id"], None)
     return {"closed": a["doc_id"]}
+
+
+@tool("lo_show_doc", "Show or hide the window of a specific open document. "
+                     "Useful to reveal a doc to the user, or to quietly "
+                     "tuck away a temporary one without closing it.",
+      obj({"doc_id": S(), "visible": B("True to show, false to hide")},
+          ["doc_id", "visible"]))
+def t_show_doc(a):
+    visible = bool(a.get("visible", True))
+    LO_.set_visible(a["doc_id"], visible)
+    return {"doc_id": a["doc_id"], "visible": visible}
 
 
 @tool("lo_convert", "Convert a file to another format without keeping it open "
@@ -390,25 +517,34 @@ def t_close(a):
            "out_path": S("Destination file; extension picks the format")},
           ["path", "out_path"]))
 def t_convert(a):
-    r = t_open({"path": a["path"], "read_only": True})
+    r = t_open({"path": a["path"], "read_only": True, "visible": False})
     try:
         res = t_save({"doc_id": r["doc_id"], "path": a["out_path"]})
     finally:
+        # Scratch document owned by the agent: safe to drop.
         t_close({"doc_id": r["doc_id"]})
     return res
 
 
-@tool("lo_shutdown", "Terminate the headless LibreOffice backend (it restarts "
-                     "automatically on the next call). Unsaved changes are lost.",
+@tool("lo_shutdown", "Detach the agent from LibreOffice without killing the "
+                     "user's instance. If the agent started its own instance, "
+                     "it is terminated; a user-started instance is left "
+                     "running untouched.",
       obj({}))
 def t_shutdown(a):
-    try:
-        LO_.connect().terminate()
-    except Exception:
-        pass
+    # Only terminate an instance we started ourselves.
+    if LO_.spawned and LO_.proc:
+        try:
+            LO_.connect().terminate()
+        except Exception:
+            pass
+        LO_.proc = None
     LO_.docs.clear()
+    LO_.meta.clear()
     LO_.ctx = LO_.desktop = None
-    return {"terminated": True}
+    LO_.spawned = False
+    return {"terminated": not LO_.spawned,
+            "note": "user instance left running"}
 
 
 # ---- Writer --------------------------------------------------------------
@@ -983,10 +1119,16 @@ def handle(msg):
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "libreoffice", "version": VERSION},
             "instructions": (
-                "Drives a headless LibreOffice. Open or create a document "
-                "(lo_open / lo_new) to get a doc_id, edit it with the "
-                "writer_* / calc_* / impress_* / draw_* tools, then lo_save "
-                "and lo_close. Changes only reach disk on lo_save."),
+                "This server shares one LibreOffice instance with the "
+                "user, so their edits and yours are the same document. "
+                "lo_open and lo_new show the window by default; pass "
+                "visible=false to work quietly. lo_show_doc shows or "
+                "hides one document without touching the others, and "
+                "lo_list_docs reports visible and agent_created per doc. "
+                "Do not close documents the user is viewing: lo_close "
+                "refuses while unsaved changes exist, and lo_shutdown "
+                "only drops the connection, never the user's app. "
+                "Nothing reaches disk until lo_save."),
         })
     elif method in ("notifications/initialized", "notifications/cancelled"):
         pass

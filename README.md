@@ -6,8 +6,9 @@
 
 An MCP server that lets an agent — Claude Code, opencode, grok, Cursor, Zed, or
 anything else speaking the Model Context Protocol — read and write
-**Writer, Calc, Impress and Draw** documents through a headless LibreOffice
-instance driven over the UNO bridge.
+**Writer, Calc, Impress and Draw** documents through a LibreOffice instance
+driven over the UNO bridge. It can run its own windowless backend, or attach to
+the instance you already have open and co-edit in real time.
 
 Copyright © 2026 Joe Landman. Licensed under the [Apache License, Version 2.0](LICENSE).
 
@@ -43,10 +44,37 @@ The installer:
 
 It is idempotent — re-running it re-registers cleanly rather than duplicating.
 
+## Co-editing mode
+
+The server drives a windowless LibreOffice it starts itself, so agent work never
+pops a window on your screen. For interactive sessions you can point it at the
+instance you already have open instead:
+
+* Start LibreOffice with a UNO socket listening (`--accept`), or launch it with
+  `scripts/start_shared.py <file>` (Windows helper) or your platform's normal
+  LibreOffice start command with `--accept` added — either way the socket has to
+  be listening for the server to attach.
+* The server attaches to that instance rather than spawning its own, and
+  `lo_open` **reuses the document you already have open** instead of loading a
+  second copy. Both sides edit one component, so each sees the other's changes
+  as they happen, and no second file lock is taken.
+* `lo_open` and `lo_new` show the window by default; pass `visible=false` to
+  work quietly. `lo_show_doc` shows or hides one document's window without
+  touching the others, and `lo_list_docs` reports `visible` plus
+  `agent_created` for every document.
+* `lo_close` refuses to close a document with unsaved changes unless you pass
+  `save=true`, so an agent cannot discard work you are still editing.
+  `lo_shutdown` only drops the connection; an instance you started keeps
+  running.
+
+Two LibreOffice processes sharing one profile is unsupported and hangs on the
+profile lock, so pick one arrangement per machine: either the agent's own
+windowless instance, or a single shared one.
+
 ## How it works
 
 ```
-agent ──MCP stdio JSON-RPC──▶ lo_mcp_server.py ──UNO/URP socket──▶ soffice --headless
+agent ──MCP stdio JSON-RPC──▶ lo_mcp_server.py ──UNO/URP socket──▶ soffice
 ```
 
 The server starts `soffice` on first use with its **own user profile**
@@ -54,11 +82,11 @@ The server starts `soffice` on first use with its **own user profile**
 LibreOffice session. It stays up between calls; open documents keep their
 `doc_id` across tool calls in a session.
 
-## Tools (32)
+## Tools (33)
 
 | Group | Tools |
 | --- | --- |
-| Session | `lo_status` `lo_list_docs` `lo_new` `lo_open` `lo_save` `lo_close` `lo_convert` `lo_shutdown` |
+| Session | `lo_status` `lo_list_docs` `lo_new` `lo_open` `lo_save` `lo_close` `lo_shutdown` `lo_convert` `lo_show_doc` |
 | Writer | `writer_get_text` `writer_get_paragraphs` `writer_append` `writer_replace` `writer_set_paragraph` `writer_insert_table` `writer_insert_image` `writer_list_styles` |
 | Calc | `calc_list_sheets` `calc_add_sheet` `calc_read` `calc_write` `calc_clear` `calc_recalculate` |
 | Impress | `impress_list_slides` `impress_add_slide` `impress_set_text` `impress_delete_slide` `impress_set_notes` |
@@ -80,15 +108,16 @@ Positions and sizes are in **mm**; colors are `#RRGGBB`.
 | `LO_MCP_PORT` | `2002` | UNO socket port (bind one per user/machine) |
 | `LO_MCP_PROFILE` | `~/.cache/lo-mcp-profile` | dedicated LibreOffice profile |
 | `LO_MCP_SOFFICE` | auto | path to `soffice` |
-| `LO_MCP_ROOTS` | `$HOME:/tmp` | `:`-separated dirs documents may live under; `/` disables the check |
+| `LO_MCP_ROOTS` | unset | path-separator delimited dirs documents may live under; unset means any path, `/` also disables the check |
 | `LO_MCP_ALLOW_EXEC` | unset | `1` enables `lo_run_uno` |
 | `LO_MCP_OWN_SOFFICE_ONLY` | unset | `1` refuses to attach to a LibreOffice this server did not start |
 | `LO_MCP_SANDBOX` | unset | label for the confinement in use; reported by `lo_status` |
 
 By itself `LO_MCP_ROOTS` is a guard rail, not a sandbox: it stops an agent from
 wandering into `/etc` by accident, but the server runs with your full user
-rights. Leave `lo_run_uno` off unless you want the escape hatch. For an actual
-boundary, see below.
+rights. It is empty by default, so set it when you want that guard rail. Leave
+`lo_run_uno` off unless you want the escape hatch. For an actual boundary, see
+below.
 
 ## Security perimeter
 
