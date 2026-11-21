@@ -183,13 +183,13 @@ class LO:
             self.connect()
             return self.ctx.ServiceManager.createInstanceWithContext(name, self.ctx)
     # -- documents ----------------------------------------------------
-    def register(self, doc, kind, visible=True):
+    def register(self, doc, kind, visible=True, agent_created=True):
         did = "%s%d" % (kind, self._next)
         self._next += 1
         self.docs[did] = doc
         self.meta[did] = {
             "kind": kind,
-            "agent_created": True,
+            "agent_created": agent_created,
             "visible": visible,
         }
         return did
@@ -238,7 +238,53 @@ class LO:
                     return did
             except Exception:
                 continue
-        return self.register(doc, doc_kind(doc), visible=self._is_visible(doc))
+        return self.register(doc, doc_kind(doc), visible=self._is_visible(doc),
+                             agent_created=False)
+
+    def sync_desktop(self):
+        """Adopt every document the user opened outside this server.
+
+        The registry only knows about components created through lo_new /
+        lo_open, so a file opened by double-clicking in Explorer stayed
+        invisible to lo_list_docs.  Walking the desktop's Components keeps
+        both sides on one object: the tool then edits the very document the
+        user is looking at, and no second file lock is taken.
+        """
+        if self.desktop is None:
+            return
+        try:
+            enum = self.desktop.Components.createEnumeration()
+        except Exception:
+            return
+        while enum.hasMoreElements():
+            try:
+                comp = enum.nextElement()
+            except Exception:
+                continue
+            try:
+                url = comp.getURL()
+            except Exception:
+                continue
+            if not url:
+                continue                  # start centre / empty frame
+            if self._tracked(url):
+                continue
+            try:
+                self.register(comp, doc_kind(comp),
+                              visible=self._is_visible(comp),
+                              agent_created=False)
+            except Exception:
+                continue
+
+    def _tracked(self, url):
+        """True when a component with this URL is already registered."""
+        for d in list(self.docs.values()):
+            try:
+                if d.getURL() == url:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _is_visible(self, doc):
         try:
@@ -387,8 +433,15 @@ def t_status(a):
 
 
 @tool("lo_list_docs", "List documents currently open, with per-document "
-                      "visibility and origin info.", obj({}))
+                      "visibility and origin info. Documents you opened "
+                      "outside the server (double-click, File > Open) are "
+                      "picked up too, with agent_created false.",
+      obj({}))
 def t_list_docs(a):
+    # Adopt whatever the user opened since the last call, so a file opened
+    # from Explorer shows up here instead of being invisible to the tools.
+    LO_.connect()
+    LO_.sync_desktop()
     out = []
     for did, doc in list(LO_.docs.items()):
         try:
